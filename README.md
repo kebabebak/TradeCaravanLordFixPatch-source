@@ -1,6 +1,6 @@
 # TradeCaravanLordFixPatch — build kit
 
-Ready-to-use patch is here: https://github.com/kebabebak/HSK-Trade-Caravan-Lord-Fix-Patch
+> Ready-to-use patch is here: https://github.com/kebabebak/HSK-Trade-Caravan-Lord-Fix-Patch
 
 Files to compile `TradeCaravanLordFixPatch.dll` for RimWorld HSK 1.5.
 
