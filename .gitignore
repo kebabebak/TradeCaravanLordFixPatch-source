@@ -1,0 +1,7 @@
+out/
+bin/
+obj/
+*.ps1
+*.user
+*.suo
+.vs/
