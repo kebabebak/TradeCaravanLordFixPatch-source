@@ -14,25 +14,27 @@ namespace HSK.TradeCaravanLordFixPatch
     /// Trigger_Custom closure and reads trader.mindState.traderDismissed with no null check. When
     /// FindTrader was null at CreateGraph time (or the capture was lost on load), LordTick throws
     /// NullReferenceException every tick — while travel/chill toils still run and the caravan can
-    /// walk to the colony normally.
+    /// walk to the colony normally. A naive "always false when trader is null" guard stops the NRE
+    /// but also blocks JobDriver_DismissTrader: that job sets traderDismissed on the traded pawn,
+    /// and the leave transition never fires, so colonists keep standing and dismiss stays unavailable.
     ///
-    /// Fix: Prefix the CreateGraph dismiss trigger (&lt;&gt;c__DisplayClass7_0.&lt;CreateGraph&gt;b__0) to skip
-    /// the original when trader/mindState is null (treat as "not dismissed"), optionally rebind
-    /// trader via FindTrader. RemoveLord only empty orphan trade lords (no ownedPawns). Do not
-    /// RemoveLord when FindTrader is null but pawns remain — that would tear down a living caravan
-    /// and send it to the map edge.
+    /// Fix: replace the CreateGraph dismiss predicate with a null-safe check. Prefer the captured
+    /// trader / FindTrader pawn; if neither works, treat dismiss as true when any owned pawn has
+    /// mindState.traderDismissed (the pawn JobDriver_DismissTrader actually flagged). RemoveLord
+    /// only empty orphan trade lords (no ownedPawns) — never tear down a living caravan because
+    /// FindTrader returned null.
     ///
     /// Проблема: vanilla LordJob_TradeWithColony.CreateGraph сохраняет FindTrader(lord) в замыкании
     /// Trigger_Custom и читает trader.mindState.traderDismissed без null-check. Если FindTrader был
     /// null при CreateGraph (или ссылка потерялась при load), LordTick каждый тик кидает
-    /// NullReferenceException — при этом travel/chill toils работают, и караван может нормально
-    /// идти к колонии.
+    /// NullReferenceException — при этом travel/chill toils работают. Наивный guard «всегда false
+    /// при null trader» убирает NRE, но ломает JobDriver_DismissTrader: job ставит traderDismissed
+    /// на торгуемую пешку, переход «уйти» не срабатывает, караван топчется, отказ недоступен.
     ///
-    /// Исправление: Prefix на dismiss-trigger CreateGraph (&lt;&gt;c__DisplayClass7_0.&lt;CreateGraph&gt;b__0) —
-    /// при null trader/mindState пропускать оригинал (считать «не dismissed»), при возможности
-    /// перепривязать trader через FindTrader. RemoveLord только для пустых orphan trade-lord (нет
-    /// ownedPawns). Не удалять lord при FindTrader == null, если пешки ещё есть — иначе живой
-    /// караван развалится и уйдёт к краю карты.
+    /// Исправление: заменить dismiss-предикат CreateGraph на null-safe проверку. Сначала captured
+    /// trader / FindTrader; если оба недоступны — считать dismiss true, когда у любой owned-пешки
+    /// traderDismissed (флаг от JobDriver_DismissTrader). RemoveLord только для пустых orphan
+    /// trade-lord — не снимать живой караван из‑за FindTrader == null.
     /// </summary>
     public class TradeCaravanLordFixPatchMod : Mod
     {
@@ -106,13 +108,15 @@ namespace HSK.TradeCaravanLordFixPatch
     }
 
     /// <summary>
-    /// Prefix on the compiler-generated CreateGraph dismiss predicate. return false is required:
-    /// the original unconditionally dereferences captured trader.mindState; Postfix cannot prevent
-    /// the NRE. Scope is a single boolean trigger used only for the "trader dismissed" transition.
+    /// Prefix replacement for the compiler-generated CreateGraph dismiss predicate. return false is
+    /// required: the original unconditionally dereferences captured trader.mindState. The replacement
+    /// mirrors vanilla (Tick signal + traderDismissed) and adds FindTrader rebind + owned-pawn scan
+    /// so JobDriver_DismissTrader still starts the leave transition when FindTrader is null.
     ///
-    /// Prefix на compiler-generated предикат dismiss в CreateGraph. return false обязателен: оригинал
-    /// безусловно читает trader.mindState; Postfix не может предотвратить NRE. Область — один
-    /// boolean-trigger только для перехода «торговец dismissed».
+    /// Prefix-замена compiler-generated dismiss-предиката CreateGraph. return false обязателен:
+    /// оригинал безусловно читает trader.mindState. Замена повторяет vanilla (сигнал Tick +
+    /// traderDismissed) и добавляет перепривязку FindTrader + обход owned-пешек, чтобы
+    /// JobDriver_DismissTrader по-прежнему запускал уход при FindTrader == null.
     /// </summary>
     [HarmonyPriority(Priority.First)]
     internal static class TradeDismissTrigger_Patch
@@ -146,34 +150,82 @@ namespace HSK.TradeCaravanLordFixPatch
         }
 
         /// <summary>
-        /// Runs vanilla when the captured trader is usable; otherwise tries FindTrader rebind, else
-        /// returns false ("not dismissed") without throwing.
+        /// Null-safe dismiss check for Tick signals. Rebinds/finds trader when possible; otherwise
+        /// honors traderDismissed on any lord-owned pawn set by JobDriver_DismissTrader.
         ///
-        /// Вызывает vanilla при usable captured trader; иначе пробует перепривязку FindTrader, иначе
-        /// возвращает false («не dismissed») без исключения.
+        /// Null-safe проверка dismiss на Tick. Перепривязывает/ищет trader при возможности; иначе
+        /// учитывает traderDismissed у любой owned-пешки от JobDriver_DismissTrader.
         /// </summary>
         public static bool Prefix(object __instance, TriggerSignal s, ref bool __result)
         {
-            Pawn trader = TraderField?.GetValue(__instance) as Pawn;
-            if (IsUsableTrader(trader))
+            // Vanilla: s.type == TriggerSignalType.Tick && trader.mindState.traderDismissed
+            if (s.type != TriggerSignalType.Tick)
             {
-                return true;
+                __result = false;
+                return false;
             }
 
-            Pawn repaired = TryFindTrader(__instance);
-            if (IsUsableTrader(repaired))
+            Pawn trader = ResolveTrader(__instance);
+            if (IsUsableTrader(trader))
             {
-                TraderField?.SetValue(__instance, repaired);
+                if (trader.mindState.traderDismissed)
+                {
+                    __result = true;
+                    PatchLog.Message(
+                        $"[TradeCaravanLordFixPatch] Dismiss trigger: trader {trader.LabelShort} flagged.");
+                    return false;
+                }
+
+                // Captured/FindTrader pawn may differ from the pawn the player dismissed.
+                if (AnyOwnedPawnTraderDismissed(__instance, out Pawn dismissed))
+                {
+                    __result = true;
+                    PatchLog.Message(
+                        $"[TradeCaravanLordFixPatch] Dismiss trigger: owned pawn {dismissed.LabelShort} " +
+                        "flagged (not FindTrader role).");
+                    return false;
+                }
+
+                __result = false;
+                return false;
+            }
+
+            if (AnyOwnedPawnTraderDismissed(__instance, out Pawn flagged))
+            {
+                __result = true;
                 PatchLog.Message(
-                    $"[TradeCaravanLordFixPatch] Rebound dismiss-trigger trader → {repaired.LabelShort}.");
-                return true;
+                    $"[TradeCaravanLordFixPatch] Dismiss trigger: owned pawn {flagged.LabelShort} " +
+                    "flagged while FindTrader unavailable.");
+                return false;
             }
 
             __result = false;
-            PatchLog.Message(
-                "[TradeCaravanLordFixPatch] Dismiss trigger skipped (captured trader null/unusable; " +
-                "FindTrader also failed). Caravan lord kept.");
             return false;
+        }
+
+        /// <summary>
+        /// Captured trader if usable; otherwise FindTrader result written back into the closure.
+        ///
+        /// Captured trader если usable; иначе результат FindTrader, записанный обратно в замыкание.
+        /// </summary>
+        private static Pawn ResolveTrader(object displayClass)
+        {
+            Pawn trader = TraderField?.GetValue(displayClass) as Pawn;
+            if (IsUsableTrader(trader))
+            {
+                return trader;
+            }
+
+            Pawn found = TryFindTrader(displayClass);
+            if (IsUsableTrader(found))
+            {
+                TraderField?.SetValue(displayClass, found);
+                PatchLog.Message(
+                    $"[TradeCaravanLordFixPatch] Rebound dismiss-trigger trader → {found.LabelShort}.");
+                return found;
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -193,19 +245,57 @@ namespace HSK.TradeCaravanLordFixPatch
         /// </summary>
         private static Pawn TryFindTrader(object displayClass)
         {
-            if (ThisField == null || displayClass == null)
-            {
-                return null;
-            }
-
-            var job = ThisField.GetValue(displayClass) as LordJob_TradeWithColony;
-            Lord lord = job?.lord;
+            Lord lord = GetLord(displayClass);
             if (lord == null)
             {
                 return null;
             }
 
             return TraderCaravanUtility.FindTrader(lord);
+        }
+
+        /// <summary>
+        /// True when any living owned pawn has mindState.traderDismissed (JobDriver_DismissTrader target).
+        ///
+        /// Истина, если у любой живой owned-пешки traderDismissed (цель JobDriver_DismissTrader).
+        /// </summary>
+        private static bool AnyOwnedPawnTraderDismissed(object displayClass, out Pawn dismissed)
+        {
+            dismissed = null;
+            Lord lord = GetLord(displayClass);
+            List<Pawn> pawns = lord?.ownedPawns;
+            if (pawns == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < pawns.Count; i++)
+            {
+                Pawn pawn = pawns[i];
+                if (!IsUsableTrader(pawn))
+                {
+                    continue;
+                }
+
+                if (pawn.mindState.traderDismissed)
+                {
+                    dismissed = pawn;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Lord GetLord(object displayClass)
+        {
+            if (ThisField == null || displayClass == null)
+            {
+                return null;
+            }
+
+            var job = ThisField.GetValue(displayClass) as LordJob_TradeWithColony;
+            return job?.lord;
         }
     }
 
@@ -244,9 +334,9 @@ namespace HSK.TradeCaravanLordFixPatch
     }
 
     /// <summary>
-    /// Optional verbose logging for dismiss-trigger skips, trader rebinds, and orphan removals.
+    /// Optional verbose logging for dismiss resolution, trader rebinds, and orphan removals.
     ///
-    /// Опциональный подробный лог пропусков dismiss-trigger, перепривязок торговца и удаления orphan.
+    /// Опциональный подробный лог dismiss-разрешения, перепривязок торговца и удаления orphan.
     /// </summary>
     public class TradeCaravanLordFixPatchSettings : ModSettings
     {
